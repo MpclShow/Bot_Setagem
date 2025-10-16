@@ -1,4 +1,3 @@
-
 import discord
 from flask import Flask
 from threading import Thread
@@ -10,7 +9,6 @@ from discord.ui import View, button, Modal, TextInput, Select
 from datetime import datetime, timedelta
 import asyncio
 from datetime import datetime
-import pytz  # pip install pytz
 
 config_global = {}
 
@@ -22,7 +20,7 @@ app = Flask('')
 
 @app.route('/')
 def main():
-    return "O bot  está online! ver. 0.0.2"
+    return "O bot está online! ver. 0.0.3"
 
 
 def run():
@@ -100,7 +98,7 @@ def niveis_disponiveis(guild_id: int):
     conn.close()
     return resultados
 
-    # Função utilitária para remover do banco (já existente ou adaptada)
+# Função utilitária para remover do banco (já existente ou adaptada)
 def remover_cadastro(guild_id: int, usuario_id: int):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -161,6 +159,7 @@ def criar_tabelas():
     """)
     
     # ---------------- Tabela de Cargos por Permissão ----------------
+    # Ajustado para usar cargo_nome conforme a implementação original do checar_permissao_multiplos_niveis
     c.execute("""
         CREATE TABLE IF NOT EXISTS cargos_permissao (
             guild_id TEXT,
@@ -303,7 +302,7 @@ def checar_permissao_multiplos_niveis(user, niveis):
     Pode receber um único nível (int/str) ou uma lista de níveis ([0, 1, 2...]).
     """
     try:
-        with sqlite3.connect('config.db') as conn:
+        with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
 
             # Garante que 'niveis' é sempre uma lista
@@ -356,8 +355,25 @@ def membros_com_permissao_dinamico(guild: discord.Guild):
     niveis = niveis_disponiveis_guild(guild.id)
     membros_autorizados = []
 
+    # Otimização: buscar todos os nomes de cargos autorizados de uma vez
+    cargos_autorizados_nomes = set()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    for nivel in niveis:
+        c.execute(
+            "SELECT cargo_nome FROM cargos_permissao WHERE guild_id=? AND nivel=?",
+            (str(guild.id), nivel)
+        )
+        cargos_autorizados_nomes.update([row[0] for row in c.fetchall()])
+    conn.close()
+
+    if not cargos_autorizados_nomes:
+        return []
+
+    # Otimização: verificar apenas os cargos do membro
     for membro in guild.members:
-        if checar_permissao_multiplos_niveis(membro, niveis):
+        membro_cargos_nomes = {role.name for role in membro.roles}
+        if any(cargo_nome in membro_cargos_nomes for cargo_nome in cargos_autorizados_nomes):
             membros_autorizados.append(membro)
 
     return membros_autorizados
@@ -398,16 +414,19 @@ async def on_ready():
     await bot.tree.sync()
     print(f"✅ Bot online como {bot.user}")
     print("📋 Comandos de barra sincronizados.")
-    print("O bot  está online! ver. 0.0.1.2")
+    print("O bot está online! ver. 0.0.3")
 
 # -------------------- Modal de Solicitação --------------------
 
-
+# MODIFICAÇÃO 1/3: RecrutamentoModal ajustada para receber cargo/prefixo pré-definidos.
 class RecrutamentoModal(Modal, title="📋 Solicitação de Recrutamento"):
-    def __init__(self, config, recrutador_member: discord.Member):
+    def __init__(self, config, recrutador_member: discord.Member, cargo: discord.Role, prefixo_usado: str):
         super().__init__()
         self.config = config
         self.recrutador_member = recrutador_member
+        self.cargo = cargo
+        self.prefixo_usado = prefixo_usado
+        
         self.nome = TextInput(label="Nome no servidor",
                               placeholder="Ex: Nome no Jogo", required=True)
         self.id_jogo = TextInput(
@@ -421,18 +440,15 @@ class RecrutamentoModal(Modal, title="📋 Solicitação de Recrutamento"):
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
         config = self.config
-        if normalizar_sim_nao(config["trabalha_com_criancas"]) == "sim" and config.get("cargo_crianca"):
-            cargo = discord.utils.get(
-                guild.roles, name=config["cargo_crianca"])
-            prefixo_usado = config.get(
-                "prefixo_criancas", config.get("prefixo", "APR"))
-        else:
-            cargo = discord.utils.get(guild.roles, name=config["cargo_padrao"])
-            prefixo_usado = config.get("prefixo", "APR")
+        
+        cargo = self.cargo
+        prefixo_usado = self.prefixo_usado
+        
         if not cargo:
-            await interaction.response.send_message(f"❌ Cargo `{cargo.name if cargo else 'N/A'}` não encontrado.", ephemeral=True)
+            await interaction.response.send_message(f"❌ Cargo necessário não encontrado.", ephemeral=True)
             return
 
+        # Busca canal de confirmação
         if config.get("canal_confirmacao_id"):
             canal_confirmacao = guild.get_channel(
                 config["canal_confirmacao_id"])
@@ -455,7 +471,12 @@ class RecrutamentoModal(Modal, title="📋 Solicitação de Recrutamento"):
                     interaction.user, f"{prefixo_usado} | {self.nome.value} | {self.id_jogo.value}", self.tel_jogo.value, cargo, self.recrutador_member, config)
                 await canal_confirmacao.send(embed=embed, view=view)
                 await interaction.response.send_message(f"✅ Sua solicitação foi enviada para aprovação em {canal_confirmacao.mention}", ephemeral=True)
-
+            else:
+                await interaction.response.send_message(f"✅ Sua solicitação foi enviada para o recrutador!", ephemeral=True)
+        # Se não houver canal de confirmação, confirma ao usuário
+        else:
+             await interaction.response.send_message(f"✅ Sua solicitação foi enviada para o recrutador!", ephemeral=True)
+        
 # -------------------- View de Aprovação --------------------
 
 
@@ -485,6 +506,7 @@ class ConfirmacaoView(View):
         ConfirmacaoView.bloqueios.add(membro.id)
 
         try:
+            # Note: Checando permissão em nível 0 ou 1, conforme a lógica original
             if not checar_permissao_multiplos_niveis(interaction.user, [0, 1]):
                 await interaction.response.send_message(
                     f"❌ Você não tem permissão para {acao}.",
@@ -512,9 +534,11 @@ class ConfirmacaoView(View):
                 guild.roles, name=self.config["cargo_padrao"])
             cargo_crianca = discord.utils.get(
                 guild.roles, name=self.config.get("cargo_crianca"))
-            if cargo_padrao in membro.roles or (cargo_crianca and cargo_crianca in membro.roles):
+            
+            # Checa se o membro JÁ está setado
+            if membro is None or (cargo_padrao and cargo_padrao in membro.roles) or (cargo_crianca and cargo_crianca in membro.roles):
                 await interaction.response.send_message(
-                    f"⚠️ O membro {membro.mention} já está setado.",
+                    f"⚠️ O membro {membro.mention if membro else 'N/A'} já está setado ou não existe.",
                     ephemeral=True
                 )
                 return
@@ -560,7 +584,7 @@ class ConfirmacaoView(View):
                     embed_log.add_field(name="Telefone", value=self.tel, inline=False)
                     embed_log.add_field(name="Cargo", value=self.cargo.mention, inline=False)
                     embed_log.add_field(name="Recrutador", value=self.recrutador.mention, inline=False)
-                    embed_log.add_field(name="Ação", value="Aprovado", inline=False)
+                    embed_log.add_field(name="Ação", value="Aprovado" if acao == "aprovar" else "Rejeitado", inline=False)
                     embed_log.add_field(name="Responsável", value=interaction.user.mention, inline=False)
                     await canal_log.send(embed=embed_log)
 
@@ -569,32 +593,42 @@ class ConfirmacaoView(View):
                 "❌ Não foi possível aplicar a ação (verifique a hierarquia de cargos).",
                 ephemeral=True
             )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Erro inesperado ao processar: {e}",
+                ephemeral=True
+            )
         finally:
             await asyncio.sleep(1)
             ConfirmacaoView.bloqueios.discard(membro.id)
 
     async def on_timeout(self):
         try:
-            for child in self.children:
-                child.disabled = True
-            await self.message.edit(
-                content="⌛ **Solicitação expirada** — ninguém aprovou ou rejeitou a tempo.",
-                view=self
-            )
+            # Verifica se a mensagem ainda existe para editar
+            if self.message:
+                for child in self.children:
+                    child.disabled = True
+                await self.message.edit(
+                    content="⌛ **Solicitação expirada** — ninguém aprovou ou rejeitou a tempo.",
+                    view=self
+                )
 
-            if self.config.get("canal_log_id"):
-                guild = self.usuario.guild
-                canal_log = guild.get_channel(self.config["canal_log_id"])
-                if canal_log:
-                    embed_log = discord.Embed(
-                        title="⏰ Recrutamento Expirado",
-                        description=f"A solicitação de set para {self.usuario.mention} expirou automaticamente.",
-                        color=discord.Color.orange()
-                    )
-                    embed_log.add_field(name="Nick", value=self.nick, inline=False)
-                    embed_log.add_field(name="Cargo", value=self.cargo.mention, inline=False)
-                    embed_log.add_field(name="Recrutador", value=self.recrutador.mention, inline=False)
-                    await canal_log.send(embed=embed_log)
+                if self.config.get("canal_log_id"):
+                    guild = self.usuario.guild
+                    canal_log = guild.get_channel(self.config["canal_log_id"])
+                    if canal_log:
+                        embed_log = discord.Embed(
+                            title="⏰ Recrutamento Expirado",
+                            description=f"A solicitação de set para {self.usuario.mention} expirou automaticamente.",
+                            color=discord.Color.orange()
+                        )
+                        embed_log.add_field(name="Nick", value=self.nick, inline=False)
+                        embed_log.add_field(name="Cargo", value=self.cargo.mention, inline=False)
+                        embed_log.add_field(name="Recrutador", value=self.recrutador.mention, inline=False)
+                        await canal_log.send(embed=embed_log)
+        except discord.NotFound:
+             # Mensagem já foi apagada
+            pass
         except Exception as e:
             print(f"[Erro Timeout] {e}")
 
@@ -660,7 +694,7 @@ async def ranking_recrutadores(interaction: discord.Interaction, periodo: str = 
 
 # -------------------- View do botão de solicitação --------------------
 
-
+# MODIFICAÇÃO 2/3: RecrutamentoView ajustada para incluir o seletor de criança.
 class RecrutamentoView(View):
     def __init__(self, config):
         super().__init__(timeout=None)
@@ -672,13 +706,9 @@ class RecrutamentoView(View):
         usuario = interaction.user
         guild = interaction.guild
 
-        cargo_padrao = discord.utils.get(
-            guild.roles, name=config["cargo_padrao"])
-        cargo_crianca = discord.utils.get(
-            guild.roles, name=config.get("cargo_crianca"))
-
+        # --- Verificações Iniciais ---
+        
         # 🔹 Bloqueia se o usuário tiver QUALQUER cargo além do @everyone
-        # ou se já for Aprendiz / cargo_crianca
         for cargo in usuario.roles:
             if cargo != guild.default_role:  # ignora apenas @everyone
                 await interaction.response.send_message(
@@ -704,7 +734,7 @@ class RecrutamentoView(View):
             )
             return
 
-        # 🔹 Monta seletor de recrutador
+        # --- Fluxo de Seleção de Recrutador ---
         membros = membros_com_permissao_dinamico(guild)
         options = [discord.SelectOption(
             label=m.display_name, value=str(m.id)) for m in membros
@@ -716,23 +746,81 @@ class RecrutamentoView(View):
                 ephemeral=True
             )
             return
+        
+        
+        # -----------------------------------------------
+        # ⚙️ FUNÇÕES AUXILIARES PARA FLUXO DE SELEÇÃO
+        # -----------------------------------------------
+        
+        # Função que define o cargo/prefixo e abre o modal
+        async def abrir_modal_recrutamento(interaction_orig: discord.Interaction, recrutador: discord.Member, eh_crianca: str):
+            
+            cargo_padrao_role = discord.utils.get(guild.roles, name=config["cargo_padrao"])
+            cargo_crianca_role = discord.utils.get(guild.roles, name=config.get("cargo_crianca"))
 
-        select = Select(
-            placeholder="Escolha quem está te recrutando", options=options)
+            if eh_crianca == "sim" and normalizar_sim_nao(config["trabalha_com_criancas"]) == "sim" and cargo_crianca_role:
+                cargo_final = cargo_crianca_role
+                prefixo_final = config.get("prefixo_criancas", config.get("prefixo", "APR"))
+            else:
+                cargo_final = cargo_padrao_role
+                prefixo_final = config.get("prefixo", "APR")
+                
+            if not cargo_final:
+                await interaction_orig.response.send_message("❌ Cargo padrão ou de criança não configurado.", ephemeral=True)
+                return
 
-        async def callback(interaction2):
-            recrutador_id = int(interaction2.data["values"][0])
+            modal = RecrutamentoModal(config, recrutador, cargo_final, prefixo_final)
+            await interaction_orig.response.send_modal(modal)
+
+
+        # Função que exibe a pergunta sobre ser criança (Se necessário)
+        async def selecionar_crianca(interaction_recrutador: discord.Interaction, recrutador: discord.Member):
+            
+            select_crianca = Select(
+                placeholder="Você trabalha como criança (Menor de 14)?",
+                options=[
+                    discord.SelectOption(label="Sim", value="sim", description="Para quem tem menos de 14 anos."),
+                    discord.SelectOption(label="Não", value="nao", description="Para quem tem 14 anos ou mais."),
+                ]
+            )
+
+            async def callback_crianca(interaction_crianca):
+                eh_crianca = interaction_crianca.data["values"][0]
+                await abrir_modal_recrutamento(interaction_crianca, recrutador, eh_crianca)
+
+            select_crianca.callback = callback_crianca
+            view_crianca = View(timeout=180)
+            view_crianca.add_item(select_crianca)
+            
+            await interaction_recrutador.response.edit_message(
+                content="✅ Recrutador escolhido! Agora, confirme se você trabalha como criança:",
+                view=view_crianca
+            )
+        
+        # Função que processa a escolha do recrutador
+        async def callback_recrutador(interaction_recrutador):
+            recrutador_id = int(interaction_recrutador.data["values"][0])
             recrutador = guild.get_member(recrutador_id)
-            await interaction2.response.send_modal(RecrutamentoModal(self.config, recrutador))
+            
+            # --- Se o servidor trabalha com crianças, abre o seletor de criança ---
+            if normalizar_sim_nao(config["trabalha_com_criancas"]) == "sim" and config.get("cargo_crianca"):
+                await selecionar_crianca(interaction_recrutador, recrutador)
+            # --- Caso contrário, abre o modal de recrutamento direto com cargo padrão ---
+            else:
+                await abrir_modal_recrutamento(interaction_recrutador, recrutador, eh_crianca="nao")
 
-        select.callback = callback
-        view = View()
-        view.add_item(select)
+        # --- Exibir o seletor de recrutador ---
+        
+        select_recrutador = Select(
+            placeholder="Escolha quem está te recrutando", options=options)
+        select_recrutador.callback = callback_recrutador
+        
+        view_recrutador = View(timeout=180)
+        view_recrutador.add_item(select_recrutador)
 
         await interaction.response.send_message(
-            "Escolha quem está te recrutando:", view=view, ephemeral=True
+            "Escolha quem está te recrutando:", view=view_recrutador, ephemeral=True
         )
-
 
 # -------------------- Comandos de Slash --------------------
 
@@ -755,9 +843,9 @@ class RecrutamentoView(View):
 async def configuracao(
     interaction: discord.Interaction,
     trabalha_com_criancas: str,
-    cargo: discord.Role,                # ✅ Aceita menção direta do cargo
+    cargo: discord.Role,               
     prefixo: str,
-    cargo_crianca: discord.Role = None, # ✅ Aceita menção direta
+    cargo_crianca: discord.Role = None, 
     prefixo_criancas: str = None,
     canal_solicitacao: discord.TextChannel = None,
     canal_confirmacao: discord.TextChannel = None,
@@ -809,25 +897,10 @@ async def configuracao(
     if canal_log:
         msg += f"\n**Canal de log**: {canal_log.mention}"
 
-        # Aqui você continua com a lógica do comando
     embed = discord.Embed(
         title="⚙️ Configuração do Sistema de Recrutamento",
-        description="Escolha a opção desejada abaixo:",
+        description=msg,
         color=discord.Color.green()
-    )
-
-    # Adicione campos com opções de configuração
-    embed.add_field(
-        name="Cargos",
-        value="`/add_cargo_nivel` — Adiciona cargos aos níveis\n"
-              "`/remover_cargo_nivel` — Remove cargos dos níveis",
-        inline=False
-    )
-    embed.add_field(
-        name="Canais",
-        value="`/setar_canal_solicitacao` — Define o canal de solicitações\n"
-              "`/setar_canal_log` — Define o canal de logs",
-        inline=False
     )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -848,10 +921,15 @@ async def enviar_botao_recrutamento(interaction: discord.Interaction):
 
     config = carregar_config(interaction.guild.id)
     if not config:
-        await interaction.response.send_message("⚠️ Configure primeiro com `/configurar_recrutamento`.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Configure primeiro com `/configuração`.", ephemeral=True)
         return
 
     canal = interaction.guild.get_channel(config["canal_solicitacao_id"])
+    
+    if not canal:
+         await interaction.response.send_message("⚠️ O canal de solicitação não foi encontrado. Verifique a configuração com `/configuração`.", ephemeral=True)
+         return
+         
     view = RecrutamentoView(config)
 
     if config["mensagem_id"]:
@@ -861,7 +939,7 @@ async def enviar_botao_recrutamento(interaction: discord.Interaction):
             await interaction.response.send_message("✅ Mensagem já existente reapinada!", ephemeral=True)
             return
         except discord.NotFound:
-            pass
+            pass # Mensagem não encontrada, enviaremos uma nova
 
     msg = await canal.send(config["mensagem_botao"], view=view)
     await msg.pin()
@@ -885,7 +963,7 @@ async def setar_mensagem_botao(interaction: discord.Interaction, mensagem: str):
 
     config = carregar_config(interaction.guild.id)
     if not config:
-        await interaction.response.send_message("⚠️ Configure primeiro o recrutamento com `/configurar_recrutamento`.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Configure primeiro o recrutamento com `/configuração`.", ephemeral=True)
         return
 
     salvar_config(interaction.guild.id, config["cargo_padrao"], config["canal_solicitacao_id"], config["canal_log_id"], config["prefixo"],
@@ -903,7 +981,7 @@ async def cmd_criar_nivel(interaction: discord.Interaction, nivel: int, nome: st
         return
 
     criar_nivel(interaction.guild.id, nivel, nome)
-    await interaction.response.send_message(f"✅ Nível `{nome}` criado com sucesso!", ephemeral=True)
+    await interaction.response.send_message(f"✅ Nível `{nivel}` criado com o nome `{nome}`!", ephemeral=True)
 
 
 @bot.tree.command(name="atribuir_acao", description="Atribui uma ação a um nível")
@@ -919,23 +997,23 @@ async def cmd_atribuir_acao(interaction: discord.Interaction, nivel: int, acao: 
 # Adicionar cargo a nível existente
 @bot.tree.command(name="add_cargo_nivel", description="Adiciona um cargo a um nível de permissão existente.")
 @app_commands.describe(
-    nivel="Nome do nível de permissão existente.",
+    nivel="Número do nível de permissão existente.", # Corrigido para INT
     cargo="Cargo que deseja adicionar a esse nível."
 )
-async def add_cargo_nivel(interaction: discord.Interaction, nivel: str, cargo: discord.Role):
+async def add_cargo_nivel(interaction: discord.Interaction, nivel: int, cargo: discord.Role):
     # Verifica se o comando foi usado em um servidor
     if not interaction.guild:
         return await interaction.response.send_message("❌ Este comando só pode ser usado em servidores.", ephemeral=True)
 
-    guild_id = interaction.guild.id
-    cargo_id = cargo.id
+    guild_id = str(interaction.guild.id)
+    cargo_nome = cargo.name # Pegar o nome do cargo
 
     try:
         # Abre conexão com o banco de dados
-        conn = sqlite3.connect("config.db")
+        conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
 
-        # Verifica se o nível existe
+        # Verifica se o nível existe na tabela 'niveis'
         c.execute("SELECT 1 FROM niveis WHERE guild_id = ? AND nivel = ?", (guild_id, nivel))
         if not c.fetchone():
             conn.close()
@@ -944,8 +1022,8 @@ async def add_cargo_nivel(interaction: discord.Interaction, nivel: str, cargo: d
                 ephemeral=True
             )
 
-        # Verifica se o cargo já está associado a esse nível
-        c.execute("SELECT 1 FROM cargos_permissao WHERE guild_id = ? AND nivel = ? AND cargo_id = ?", (guild_id, nivel, cargo_id))
+        # Verifica se o cargo já está associado a esse nível (usando cargo_nome)
+        c.execute("SELECT 1 FROM cargos_permissao WHERE guild_id = ? AND nivel = ? AND cargo_nome = ?", (guild_id, nivel, cargo_nome))
         if c.fetchone():
             conn.close()
             return await interaction.response.send_message(
@@ -953,8 +1031,8 @@ async def add_cargo_nivel(interaction: discord.Interaction, nivel: str, cargo: d
                 ephemeral=True
             )
 
-        # Adiciona o cargo ao nível
-        c.execute("INSERT INTO cargos_permissao (guild_id, nivel, cargo_id) VALUES (?, ?, ?)", (guild_id, nivel, cargo_id))
+        # Adiciona o cargo ao nível (usando cargo_nome)
+        c.execute("INSERT INTO cargos_permissao (guild_id, nivel, cargo_nome) VALUES (?, ?, ?)", (guild_id, nivel, cargo_nome))
         conn.commit()
         conn.close()
 
@@ -974,20 +1052,20 @@ async def add_cargo_nivel(interaction: discord.Interaction, nivel: str, cargo: d
 # Remover cargo de nível
 @bot.tree.command(name="remover_cargo_nivel", description="Remove um cargo de um nível de permissão existente.")
 @app_commands.describe(
-    nivel="Nome do nível do qual o cargo será removido.",
+    nivel="Número do nível do qual o cargo será removido.", # Corrigido para INT
     cargo="Cargo que deseja remover desse nível."
 )
-async def remover_cargo_nivel(interaction: discord.Interaction, nivel: str, cargo: discord.Role):
+async def remover_cargo_nivel(interaction: discord.Interaction, nivel: int, cargo: discord.Role):
     # Verifica se o comando foi usado em um servidor
     if not interaction.guild:
         return await interaction.response.send_message("❌ Este comando só pode ser usado em servidores.", ephemeral=True)
 
-    guild_id = interaction.guild.id
-    cargo_id = cargo.id
+    guild_id = str(interaction.guild.id)
+    cargo_nome = cargo.name # Pegar o nome do cargo
 
     try:
         # Abre conexão com o banco de dados
-        conn = sqlite3.connect("config.db")
+        conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
 
         # Verifica se o nível existe
@@ -999,8 +1077,8 @@ async def remover_cargo_nivel(interaction: discord.Interaction, nivel: str, carg
                 ephemeral=True
             )
 
-        # Verifica se o cargo está associado a esse nível
-        c.execute("SELECT 1 FROM cargos_permissao WHERE guild_id = ? AND nivel = ? AND cargo_id = ?", (guild_id, nivel, cargo_id))
+        # Verifica se o cargo está associado a esse nível (usando cargo_nome)
+        c.execute("SELECT 1 FROM cargos_permissao WHERE guild_id = ? AND nivel = ? AND cargo_nome = ?", (guild_id, nivel, cargo_nome))
         if not c.fetchone():
             conn.close()
             return await interaction.response.send_message(
@@ -1008,8 +1086,8 @@ async def remover_cargo_nivel(interaction: discord.Interaction, nivel: str, carg
                 ephemeral=True
             )
 
-        # Remove o cargo do nível
-        c.execute("DELETE FROM cargos_permissao WHERE guild_id = ? AND nivel = ? AND cargo_id = ?", (guild_id, nivel, cargo_id))
+        # Remove o cargo do nível (usando cargo_nome)
+        c.execute("DELETE FROM cargos_permissao WHERE guild_id = ? AND nivel = ? AND cargo_nome = ?", (guild_id, nivel, cargo_nome))
         conn.commit()
         conn.close()
 
@@ -1031,41 +1109,35 @@ async def remover_cargo_nivel(interaction: discord.Interaction, nivel: str, carg
 @app_commands.describe(
     membro="Selecione o membro a ser removido do cadastro."
 )
-async def remover_cadastro(interaction: discord.Interaction, membro: discord.Member):
+async def remover_cadastro_cmd(interaction: discord.Interaction, membro: discord.Member): # Renomeado para evitar conflito com a função utility 'remover_cadastro'
     # Verifica se o comando foi usado em um servidor
     if not interaction.guild:
         return await interaction.response.send_message("❌ Este comando só pode ser usado em servidores.", ephemeral=True)
 
-    guild_id = interaction.guild.id
-    user_id = membro.id
+    guild_id = str(interaction.guild.id)
+    user_id = str(membro.id)
 
     try:
         # --- 🔒 Verifica permissão dinâmica (baseada nos níveis configurados) ---
-        conn = sqlite3.connect("config.db")
+        conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT nivel, cargo_id FROM cargos_permissao WHERE guild_id = ?", (guild_id,))
-        permissoes = c.fetchall()
-
-        if not permissoes:
+        
+        # Obtém os nomes dos cargos de permissão
+        c.execute("SELECT DISTINCT cargo_nome FROM cargos_permissao WHERE guild_id = ?", (guild_id,))
+        cargos_autorizados_nomes = [cargo_nome for (cargo_nome,) in c.fetchall()]
+        
+        cargos_membro = [role.name for role in interaction.user.roles]
+        
+        # Verifica se o autor tem algum dos cargos de permissão
+        if not any(cargo_nome in cargos_membro for cargo_nome in cargos_autorizados_nomes):
             conn.close()
             return await interaction.response.send_message(
-                "⚠️ Nenhum cargo de permissão foi configurado ainda. Use `/add_cargo_nivel` antes.",
+                "🚫 Você **não tem permissão** para remover cadastros. É necessário ter um cargo associado a um nível.",
                 ephemeral=True
             )
 
-        # Obtém IDs de cargos autorizados
-        cargos_autorizados = [cargo_id for _, cargo_id in permissoes]
-
-        # Verifica se o autor tem algum dos cargos
-        if not any(role.id in cargos_autorizados for role in interaction.user.roles):
-            conn.close()
-            return await interaction.response.send_message(
-                "🚫 Você **não tem permissão** para remover cadastros.",
-                ephemeral=True
-            )
-
-        # --- 🔍 Verifica se o membro está cadastrado ---
-        c.execute("SELECT * FROM recrutamentos WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        # --- 🔍 Verifica se o membro está cadastrado (usando 'usuario_id') ---
+        c.execute("SELECT * FROM recrutamentos WHERE guild_id = ? AND usuario_id = ?", (guild_id, user_id))
         registro = c.fetchone()
 
         if not registro:
@@ -1076,13 +1148,17 @@ async def remover_cadastro(interaction: discord.Interaction, membro: discord.Mem
             )
 
         # --- 🗑️ Remove o registro ---
-        c.execute("DELETE FROM recrutamentos WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-        conn.commit()
-
-        # Busca o cargo de recrutado para remover
-        c.execute("SELECT cargo_recruta FROM config WHERE guild_id = ?", (guild_id,))
+        # Usa a função utilitária para manter o código limpo
+        remover_cadastro(interaction.guild.id, membro.id)
+        
+        # Busca os nomes dos cargos de setagem e canal de log
+        c.execute("SELECT cargo_padrao, cargo_crianca, canal_log_id FROM config WHERE guild_id = ?", (guild_id,))
         resultado = c.fetchone()
         conn.close()
+        
+        cargo_padrao_nome = resultado[0] if resultado else None
+        cargo_crianca_nome = resultado[1] if resultado else None
+        canal_logs_id = resultado[2] if resultado else None
 
         # Cria o embed de confirmação
         embed = discord.Embed(
@@ -1095,27 +1171,29 @@ async def remover_cadastro(interaction: discord.Interaction, membro: discord.Mem
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # --- 🎭 Remove o cargo do membro (se configurado) ---
-        if resultado and resultado[0]:
-            cargo_recruta_id = int(resultado[0])
-            cargo = interaction.guild.get_role(cargo_recruta_id)
-            if cargo and cargo in membro.roles:
-                try:
-                    await membro.remove_roles(cargo)
-                except discord.Forbidden:
-                    await interaction.followup.send(
-                        f"⚠️ Não consegui remover o cargo {cargo.mention} de {membro.mention}. Verifique minhas permissões.",
-                        ephemeral=True
-                    )
+        cargos_a_remover = []
+        
+        if cargo_padrao_nome:
+            cargo_padrao = discord.utils.get(interaction.guild.roles, name=cargo_padrao_nome)
+            if cargo_padrao and cargo_padrao in membro.roles:
+                cargos_a_remover.append(cargo_padrao)
+                
+        if cargo_crianca_nome:
+            cargo_crianca = discord.utils.get(interaction.guild.roles, name=cargo_crianca_nome)
+            if cargo_crianca and cargo_crianca in membro.roles:
+                cargos_a_remover.append(cargo_crianca)
+
+        if cargos_a_remover:
+            try:
+                await membro.remove_roles(*cargos_a_remover, reason="Remoção de cadastro de recrutamento")
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"⚠️ Não consegui remover o(s) cargo(s) de setagem de {membro.mention}. Verifique minhas permissões.",
+                    ephemeral=True
+                )
 
         # --- 🪵 Loga a ação (se canal de logs configurado) ---
-        conn = sqlite3.connect("config.db")
-        c = conn.cursor()
-        c.execute("SELECT canal_logs FROM config WHERE guild_id = ?", (guild_id,))
-        log_result = c.fetchone()
-        conn.close()
-
-        if log_result and log_result[0]:
-            canal_logs_id = int(log_result[0])
+        if canal_logs_id:
             canal_logs = interaction.guild.get_channel(canal_logs_id)
             if canal_logs:
                 log_embed = discord.Embed(
@@ -1137,40 +1215,39 @@ async def listar_cadastros(interaction: discord.Interaction, recrutador: discord
     if not interaction.guild:
         return await interaction.response.send_message("❌ Este comando só pode ser usado em servidores.", ephemeral=True)
 
-    guild_id = interaction.guild.id
+    guild_id = str(interaction.guild.id)
 
     try:
         # --- 🔒 Verificação de permissão dinâmica ---
-        conn = sqlite3.connect("config.db")
+        conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT cargo_id FROM cargos_permissao WHERE guild_id = ?", (guild_id,))
-        permissoes = [cargo_id for (cargo_id,) in c.fetchall()]
-
-        if not permissoes:
+        
+        # Obtém os nomes dos cargos de permissão
+        c.execute("SELECT DISTINCT cargo_nome FROM cargos_permissao WHERE guild_id = ?", (guild_id,))
+        cargos_autorizados_nomes = [cargo_nome for (cargo_nome,) in c.fetchall()]
+        
+        cargos_membro = [role.name for role in interaction.user.roles]
+        
+        if not any(cargo_nome in cargos_membro for cargo_nome in cargos_autorizados_nomes):
             conn.close()
             return await interaction.response.send_message(
-                "⚠️ Nenhum cargo de permissão foi configurado. Use `/add_cargo_nivel` para configurar.",
+                "🚫 Você **não tem permissão** para listar cadastros. É necessário ter um cargo associado a um nível.",
                 ephemeral=True
             )
 
-        if not any(role.id in permissoes for role in interaction.user.roles):
-            conn.close()
-            return await interaction.response.send_message(
-                "🚫 Você **não tem permissão** para listar cadastros.",
-                ephemeral=True
-            )
-
-        # --- 📋 Obtém os cadastros ---
+        # --- 📋 Obtém os cadastros (Ajuste: usando apenas as colunas existentes) ---
+        recrutador_id_str = str(recrutador.id) if recrutador else None
+        
         if recrutador:
             c.execute("""
-                SELECT user_id, nome, nick, recrutador_id, data 
+                SELECT usuario_id, recrutador_id, data 
                 FROM recrutamentos 
                 WHERE guild_id = ? AND recrutador_id = ?
                 ORDER BY data DESC
-            """, (guild_id, recrutador.id))
+            """, (guild_id, recrutador_id_str))
         else:
             c.execute("""
-                SELECT user_id, nome, nick, recrutador_id, data 
+                SELECT usuario_id, recrutador_id, data 
                 FROM recrutamentos 
                 WHERE guild_id = ?
                 ORDER BY data DESC
@@ -1197,7 +1274,7 @@ async def listar_cadastros(interaction: discord.Interaction, recrutador: discord
         total_paginas = len(paginas)
 
         def gerar_embed(pagina_idx: int):
-            titulo = "📋 Cadastros"
+            titulo = "📋 Cadastros de Recrutamento"
             if recrutador:
                 titulo += f" de {recrutador.display_name}"
 
@@ -1207,14 +1284,25 @@ async def listar_cadastros(interaction: discord.Interaction, recrutador: discord
                 color=discord.Color.blurple()
             )
 
-            for user_id, nome, nick, recrutador_id, data in paginas[pagina_idx]:
+            for usuario_id_str, recrutador_id_str, data in paginas[pagina_idx]:
+                usuario_id = int(usuario_id_str)
+                recrutador_id = int(recrutador_id_str)
+                
+                membro = interaction.guild.get_member(usuario_id)
                 recrutador_info = interaction.guild.get_member(recrutador_id)
-                membro = interaction.guild.get_member(user_id)
+                
+                nome_exibido = membro.display_name if membro else f"ID {usuario_id} (Saiu)"
+                recrutador_nome = recrutador_info.display_name if recrutador_info else f"ID {recrutador_id} (Saiu)"
+                
+                try:
+                    data_formatada = datetime.fromisoformat(data).strftime('%d/%m/%Y %H:%M:%S')
+                except ValueError:
+                    data_formatada = data
+
                 embed.add_field(
-                    name=f"{nome or 'Sem nome'} ({nick or 'Sem nick'})",
-                    value=f"👤 **Membro:** {membro.mention if membro else f'ID {user_id}'}\n"
-                          f"🎯 **Recrutador:** {recrutador_info.mention if recrutador_info else f'ID {recrutador_id}'}\n"
-                          f"📅 **Data:** {data}",
+                    name=f"👤 {nome_exibido}",
+                    value=f"🎯 **Recrutador:** {recrutador_nome}\n"
+                          f"📅 **Data:** {data_formatada}",
                     inline=False
                 )
 
@@ -1227,31 +1315,38 @@ async def listar_cadastros(interaction: discord.Interaction, recrutador: discord
                 super().__init__(timeout=180)
                 self.pagina_atual = 0
 
-            async def atualizar(self, interaction_update):
+            async def on_timeout(self):
+                if self.message:
+                    for child in self.children:
+                        child.disabled = True
+                    await self.message.edit(view=self)
+
+            async def actualizar(self, interaction_update: discord.Interaction):
                 embed = gerar_embed(self.pagina_atual)
                 await interaction_update.response.edit_message(embed=embed, view=self)
 
-            @discord.ui.button(label="⏮️", style=discord.ButtonStyle.gray)
-            async def inicio(self, interaction_button, _):
+            @discord.ui.button(label="⏮️", style=discord.ButtonStyle.gray, row=1)
+            async def inicio(self, interaction_button: discord.Interaction, _):
                 self.pagina_atual = 0
-                await self.atualizar(interaction_button)
+                await self.actualizar(interaction_button)
 
-            @discord.ui.button(label="⬅️", style=discord.ButtonStyle.blurple)
-            async def anterior(self, interaction_button, _):
+            @discord.ui.button(label="⬅️", style=discord.ButtonStyle.blurple, row=1)
+            async def anterior(self, interaction_button: discord.Interaction, _):
                 if self.pagina_atual > 0:
                     self.pagina_atual -= 1
-                    await self.atualizar(interaction_button)
+                await self.actualizar(interaction_button)
 
-            @discord.ui.button(label="➡️", style=discord.ButtonStyle.blurple)
-            async def proxima(self, interaction_button, _):
+            @discord.ui.button(label="➡️", style=discord.ButtonStyle.blurple, row=1)
+            async def proxima(self, interaction_button: discord.Interaction, _):
                 if self.pagina_atual < total_paginas - 1:
                     self.pagina_atual += 1
-                    await self.atualizar(interaction_button)
+                await self.actualizar(interaction_button)
 
-            @discord.ui.button(label="⏭️", style=discord.ButtonStyle.gray)
-            async def fim(self, interaction_button, _):
+            @discord.ui.button(label="⏭️", style=discord.ButtonStyle.gray, row=1)
+            async def fim(self, interaction_button: discord.Interaction, _):
                 self.pagina_atual = total_paginas - 1
-                await self.atualizar(interaction_button)
+                await self.actualizar(interaction_button)
+
 
         view = PaginacaoView()
         await interaction.response.send_message(embed=gerar_embed(0), view=view, ephemeral=True)
@@ -1265,16 +1360,41 @@ async def listar_cadastros(interaction: discord.Interaction, recrutador: discord
 async def listar_niveis(interaction: discord.Interaction):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT nivel, cargo_nome FROM cargos_permissao WHERE guild_id=? ORDER BY nivel", (str(interaction.guild.id),))
+    
+    # 1. Obter nomes dos níveis
+    c.execute("SELECT nivel, nome FROM niveis WHERE guild_id=? ORDER BY nivel", (str(interaction.guild.id),))
+    niveis_map = {nivel: nome for nivel, nome in c.fetchall()}
+    
+    # 2. Obter cargos por nível
+    c.execute("SELECT nivel, cargo_nome FROM cargos_permissao WHERE guild_id=? ORDER BY nivel, cargo_nome", (str(interaction.guild.id),))
     resultados = c.fetchall()
     conn.close()
-    if not resultados:
+    
+    if not niveis_map and not resultados:
         await interaction.response.send_message("⚠️ Nenhum nível configurado.", ephemeral=True)
         return
+        
     msg = ""
+    niveis_agrupados = {}
+    
+    # Agrupar cargos por nível
     for nivel, cargo in resultados:
-        msg += f"**Nível {nivel}** → {cargo}\n"
-    await interaction.response.send_message(msg, ephemeral=True)
+        if nivel not in niveis_agrupados:
+            niveis_agrupados[nivel] = []
+        niveis_agrupados[nivel].append(f"`{cargo}`")
+        
+    # Construir a mensagem
+    for nivel, nome in sorted(niveis_map.items()):
+        cargos = ", ".join(niveis_agrupados.get(nivel, ["*Nenhum cargo*"]))
+        msg += f"**Nível {nivel} - {nome}**\n   → Cargos: {cargos}\n"
+        
+    embed = discord.Embed(
+        title="📑 Níveis de Permissão Dinâmica",
+        description=msg,
+        color=discord.Color.blue()
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -1283,6 +1403,7 @@ async def listar_niveis(interaction: discord.Interaction):
 )
 @app_commands.describe(minutos="Tempo em minutos (1-120)")
 async def configurar_tempo_expiracao(interaction: discord.Interaction, minutos: int):
+    # Checando permissão em nível 0 (mais alto)
     if not checar_permissao_multiplos_niveis(interaction.user, 0):
         await interaction.response.send_message(
             "❌ Você não tem permissão para usar este comando.",
@@ -1328,24 +1449,17 @@ async def configurar_tempo_expiracao(interaction: discord.Interaction, minutos: 
 
 
 class PainelView(discord.ui.View):
-    def __init__(self, nivel_usuario: int):
+    def __init__(self, nivel_usuario: int, acoes: list):
         super().__init__(timeout=None)
         self.nivel_usuario = nivel_usuario
-
-        # Adiciona os botões com base no nível do usuário
-        if nivel_usuario == 0:
+        
+        if "configuracao" in acoes:
             self.add_item(discord.ui.Button(label="⚙️ Configurações",
-                          style=discord.ButtonStyle.primary, custom_id="config"))
+                                  style=discord.ButtonStyle.primary, custom_id="config"))
+        if "relatorios" in acoes:
             self.add_item(discord.ui.Button(
                 label="📊 Relatórios", style=discord.ButtonStyle.success, custom_id="relatorio"))
-            self.add_item(discord.ui.Button(
-                label="🎨 Visual", style=discord.ButtonStyle.secondary, custom_id="visual"))
-        elif nivel_usuario == 1:
-            self.add_item(discord.ui.Button(
-                label="📊 Relatórios", style=discord.ButtonStyle.success, custom_id="relatorio"))
-            self.add_item(discord.ui.Button(
-                label="🎨 Visual", style=discord.ButtonStyle.secondary, custom_id="visual"))
-        elif nivel_usuario == 2:
+        if "visual" in acoes:
             self.add_item(discord.ui.Button(
                 label="🎨 Visual", style=discord.ButtonStyle.secondary, custom_id="visual"))
 
@@ -1354,47 +1468,23 @@ class PainelView(discord.ui.View):
         await comando_painel(interaction)
 
     async def interaction_check(self, interaction: discord.Interaction):
-        return True
-
-# ===============================
-# Funções de níveis e ações
-# ===============================
-def niveis_disponiveis_guild(guild_id: int):
-    """Retorna todos os níveis configurados no servidor."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "SELECT DISTINCT nivel FROM niveis WHERE guild_id=? ORDER BY nivel ASC",
-        (str(guild_id),)
-    )
-    niveis = [row[0] for row in c.fetchall()]
-    conn.close()
-    return niveis
+        return True # Permite que qualquer um com o painel interaja
 
 
-def obter_acoes_nivel(guild_id: int, nivel: int):
-    """Retorna as ações disponíveis para um nível."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "SELECT acao FROM acoes_por_nivel WHERE guild_id=? AND nivel=?",
-        (str(guild_id), nivel)
-    )
-    resultados = [row[0] for row in c.fetchall()]
-    conn.close()
-    return resultados
+# Funções de níveis e ações (mantidas no escopo)
 
-
-# ===============================
 # Painel dinâmico
-# ===============================
 async def exibir_painel(interaction: discord.Interaction):
     user = interaction.user
     guild_id = interaction.guild.id
 
     # Detecta o nível mais alto do usuário
     nivel_usuario = None
-    for nivel in reversed(niveis_disponiveis_guild(guild_id)):
+    
+    # Obtém todos os níveis configurados
+    todos_niveis = niveis_disponiveis(guild_id)
+    
+    for nivel in sorted(todos_niveis, reverse=True): # Começa do nível mais alto
         if checar_permissao_multiplos_niveis(user, nivel):
             nivel_usuario = nivel
             break
@@ -1406,6 +1496,9 @@ async def exibir_painel(interaction: discord.Interaction):
         )
         return
 
+    # Adiciona campos dinamicamente de acordo com as ações do nível
+    acoes = obter_acoes_nivel(guild_id, nivel_usuario)
+    
     # Cria o embed
     embed = discord.Embed(
         title=f"🧭 Painel de Controle (Nível {nivel_usuario})",
@@ -1413,8 +1506,6 @@ async def exibir_painel(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
 
-    # Adiciona campos dinamicamente de acordo com as ações do nível
-    acoes = obter_acoes_nivel(guild_id, nivel_usuario)
     if "configuracao" in acoes:
         embed.add_field(
             name="⚙️ Configurações",
@@ -1433,14 +1524,16 @@ async def exibir_painel(interaction: discord.Interaction):
             value="Comandos para botão de recrutamento e mensagens",
             inline=False
         )
+    
+    # Se não houver ações configuradas
+    if not acoes:
+        embed.add_field(name="Sem Ações", value="Nenhuma ação foi configurada para o seu nível.", inline=False)
 
     # Exibe o painel
-    await interaction.response.send_message(embed=embed, view=PainelView(nivel_usuario), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=PainelView(nivel_usuario, acoes), ephemeral=True)
 
 
-# ===============================
 # Comando /painel
-# ===============================
 @bot.tree.command(
     name="painel",
     description="Mostra o painel de controle conforme seu nível de permissão."
@@ -1448,24 +1541,6 @@ async def exibir_painel(interaction: discord.Interaction):
 async def comando_painel(interaction: discord.Interaction):
     await exibir_painel(interaction)
 
-
-# ===============================
-# View dos botões
-# ===============================
-class PainelView(View):
-    def __init__(self, nivel_usuario: int):
-        super().__init__(timeout=None)
-        self.nivel_usuario = nivel_usuario
-
-    @button(label="🔁 Atualizar Painel", style=discord.ButtonStyle.blurple)
-    async def atualizar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await exibir_painel(interaction)
-        except Exception as e:
-            await interaction.response.send_message(
-                f"❌ Erro ao atualizar painel: {e}",
-                ephemeral=True
-            )
 
 # -------------------- Recriação automática da mensagem de recrutamento --------------------
 @bot.event
@@ -1511,5 +1586,3 @@ async def on_message_delete(message: discord.Message):
 # Inicie o servidor web e o bot
 keep_alive()
 bot.run(TOKEN)
-
-
