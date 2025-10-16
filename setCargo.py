@@ -6,7 +6,6 @@ from discord.ext import commands
 from discord import app_commands
 import os
 import sqlite3
-from dotenv import load_dotenv
 from discord.ui import View, button, Modal, TextInput, Select
 from datetime import datetime, timedelta
 import asyncio
@@ -1512,4 +1511,5 @@ async def on_message_delete(message: discord.Message):
 # Inicie o servidor web e o bot
 keep_alive()
 bot.run(TOKEN)
+
 
