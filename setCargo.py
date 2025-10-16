@@ -23,7 +23,7 @@ app = Flask('')
 
 @app.route('/')
 def main():
-    return "O bot  está online! ver. 0.0.1.2"
+    return "O bot  está online! ver. 0.0.2"
 
 
 def run():
@@ -36,7 +36,6 @@ def keep_alive():
 # -----------------------------
 
 
-load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
@@ -1513,3 +1512,4 @@ async def on_message_delete(message: discord.Message):
 # Inicie o servidor web e o bot
 keep_alive()
 bot.run(TOKEN)
+
