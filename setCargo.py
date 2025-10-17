@@ -585,6 +585,20 @@ class ConfirmacaoView(View):
         self.recrutador = recrutador
         self.config = config
 
+    # 🚨 BOTÃO 1: APROVAR 🚨
+    @discord.ui.button(label="✅ Aprovar", style=discord.ButtonStyle.green, custom_id="aprov_recrutamento")
+    async def aprovar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Desabilita todos os botões imediatamente para evitar cliques duplos
+        self.stop() 
+        await self.processar(interaction, "aprovar")
+
+    # 🚨 BOTÃO 2: REJEITAR 🚨
+    @discord.ui.button(label="❌ Rejeitar", style=discord.ButtonStyle.red, custom_id="rejeitar_recrutamento")
+    async def rejeitar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Desabilita todos os botões imediatamente para evitar cliques duplos
+        self.stop()
+        await self.processar(interaction, "rejeitar")
+
     async def processar(self, interaction: discord.Interaction, acao: str):
         guild = interaction.guild
         membro = self.usuario
@@ -1722,3 +1736,4 @@ async def on_message_delete(message: discord.Message):
 # Inicie o servidor web e o bot
 keep_alive()
 bot.run(TOKEN)
+
