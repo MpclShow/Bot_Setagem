@@ -9,8 +9,18 @@ from discord.ui import View, button, Modal, TextInput, Select
 from datetime import datetime, timedelta
 import asyncio
 from datetime import datetime
+# from dotenv import load_dotenv
 
 config_global = {}
+
+# Adicione esta lista na parte superior do seu arquivo, perto de 'config_global'
+ACOES_DISPONIVEIS = [
+    "configuracao",  # Acesso ao comando /configuracao
+    "relatorios",    # Acesso a /ranking_de_rec, /listar_cadastros, /remover_cadastro
+    "visual",        # Acesso a /enviar_botao_recrutamento, /setar_mensagem_botao
+    "atribuicao_acao", # Acesso a /atribuir_acao
+    "gerenciamento_nivel" # Acesso a /criar_nivel, /add_cargo_nivel, /remover_cargo_nivel
+]
 
 
 # --- Mantenha o bot online ---
@@ -32,7 +42,7 @@ def keep_alive():
     server.start()
 # -----------------------------
 
-
+# load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
@@ -416,6 +426,88 @@ async def on_ready():
     print("📋 Comandos de barra sincronizados.")
     print("O bot está online! ver. 0.0.3")
 
+
+# --- NOVAS CLASSES PARA O COMANDO /atribuir_acao ---
+
+class AcaoSelect(Select):
+    """Menu de seleção que permite múltiplas escolhas de ações."""
+    def __init__(self, nivel_escolhido: int, guild_id: str):
+        
+        # 1. Obtém as ações já definidas para este nível
+        self.acoes_atuais = obter_acoes_nivel(guild_id, nivel_escolhido)
+        self.nivel = nivel_escolhido
+        self.guild_id = guild_id
+        
+        options = []
+        for acao in ACOES_DISPONIVEIS:
+            # Marca como padrão se já estiver definida para o nível
+            is_default = acao in self.acoes_atuais
+            options.append(discord.SelectOption(
+                label=acao.capitalize().replace("_", " "),
+                value=acao,
+                default=is_default,
+                description="Já configurada" if is_default else "Ação disponível"
+            ))
+            
+        super().__init__(
+            placeholder=f"Selecione as ações para o Nível {nivel_escolhido}",
+            min_values=0, # Permite desmarcar todas as ações
+            max_values=len(ACOES_DISPONIVEIS),
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        # As ações selecionadas são passadas em self.values
+        acoes_selecionadas = set(self.values)
+        
+        # 1. Ações a adicionar (Selecionadas, mas não atuais)
+        acoes_a_adicionar = acoes_selecionadas - set(self.acoes_atuais)
+        for acao in acoes_a_adicionar:
+            definir_acao_nivel(self.guild_id, self.nivel, acao)
+            
+        # 2. Ações a remover (Atuais, mas não selecionadas)
+        acoes_a_remover = set(self.acoes_atuais) - acoes_selecionadas
+        
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        for acao in acoes_a_remover:
+            c.execute(
+                "DELETE FROM acoes_por_nivel WHERE guild_id=? AND nivel=? AND acao=?",
+                (self.guild_id, self.nivel, acao)
+            )
+        conn.commit()
+        conn.close()
+        
+        # Cria a mensagem de resultado
+        embed = discord.Embed(
+            title=f"✅ Ações atualizadas para o Nível {self.nivel}",
+            color=discord.Color.green()
+        )
+        if acoes_a_adicionar:
+            embed.add_field(name="Adicionadas", value="\n".join([f"➕ `{a}`" for a in acoes_a_adicionar]), inline=False)
+        if acoes_a_remover:
+            embed.add_field(name="Removidas", value="\n".join([f"➖ `{a}`" for a in acoes_a_remover]), inline=False)
+        if not acoes_a_adicionar and not acoes_a_remover:
+            embed.description = "Nenhuma alteração foi feita."
+
+        # Edita a mensagem original com o resultado e o novo seletor
+        # (Chama o seletor novamente para refletir as ações atuais)
+        nova_view = AcaoNivelView(self.nivel, interaction.guild.id)
+        
+        await interaction.response.edit_message(
+            content=f"Selecione as ações para o Nível **{self.nivel}**:",
+            embed=embed,
+            view=nova_view
+        )
+
+
+class AcaoNivelView(View):
+    """View que contém o menu de seleção de ações."""
+    def __init__(self, nivel: int, guild_id: int):
+        super().__init__(timeout=180)
+        # Adiciona o seletor na view
+        self.add_item(AcaoSelect(nivel, str(guild_id)))
+
 # -------------------- Modal de Solicitação --------------------
 
 # MODIFICAÇÃO 1/3: RecrutamentoModal ajustada para receber cargo/prefixo pré-definidos.
@@ -497,7 +589,9 @@ class ConfirmacaoView(View):
         guild = interaction.guild
         membro = self.usuario
 
+        # --- Verificação de Bloqueio (Primeira Resposta) ---
         if membro.id in ConfirmacaoView.bloqueios:
+            # Envia a mensagem de erro e retorna (Única resposta)
             await interaction.response.send_message(
                 "⚠️ Já existe uma ação em andamento para este recrutamento.",
                 ephemeral=True
@@ -506,20 +600,22 @@ class ConfirmacaoView(View):
         ConfirmacaoView.bloqueios.add(membro.id)
 
         try:
-            # Note: Checando permissão em nível 0 ou 1, conforme a lógica original
+            # --- Verificação de Permissão (Primeira Resposta) ---
             if not checar_permissao_multiplos_niveis(interaction.user, [0, 1]):
                 await interaction.response.send_message(
                     f"❌ Você não tem permissão para {acao}.",
                     ephemeral=True
                 )
-                return
+                return # Termina a função após a resposta
 
+            # --- Verificação de Autoação (Primeira Resposta) ---
             if interaction.user.id == self.usuario.id:
                 await interaction.response.send_message(
                     f"⚠️ Você não pode {acao} a si mesmo.",
                     ephemeral=True
                 )
                 if self.config.get("canal_log_id"):
+                    # Se você quer logar, use followup.send, pois a response já foi usada
                     canal_log = guild.get_channel(self.config["canal_log_id"])
                     if canal_log:
                         embed_log = discord.Embed(
@@ -527,21 +623,22 @@ class ConfirmacaoView(View):
                             description=f"{interaction.user.mention} tentou {acao} a própria solicitação.",
                             color=discord.Color.orange()
                         )
-                        await canal_log.send(embed=embed_log)
-                return
+                        # Usa followup.send, pois response.send_message já foi chamado acima
+                        await interaction.followup.send(embed=embed_log, ephemeral=False)
+                return # Termina a função após a resposta
 
             cargo_padrao = discord.utils.get(
                 guild.roles, name=self.config["cargo_padrao"])
             cargo_crianca = discord.utils.get(
                 guild.roles, name=self.config.get("cargo_crianca"))
             
-            # Checa se o membro JÁ está setado
+            # --- Verificação de Já Setado (Primeira Resposta) ---
             if membro is None or (cargo_padrao and cargo_padrao in membro.roles) or (cargo_crianca and cargo_crianca in membro.roles):
                 await interaction.response.send_message(
                     f"⚠️ O membro {membro.mention if membro else 'N/A'} já está setado ou não existe.",
                     ephemeral=True
                 )
-                return
+                return # Termina a função após a resposta
 
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
@@ -552,27 +649,30 @@ class ConfirmacaoView(View):
             ja_registrado = c.fetchone()
             conn.close()
 
+            # --- Verificação de Já Registrado (Primeira Resposta) ---
             if ja_registrado and acao == "aprovar":
                 await interaction.response.send_message(
                     f"⚠️ O membro {membro.mention} já possui um registro de recrutamento.",
                     ephemeral=True
                 )
-                return
+                return # Termina a função após a resposta
 
-            # Ação
+            # --- AÇÃO DE SUCESSO (Resposta Única: Edita a mensagem) ---
             if acao == "aprovar":
                 await membro.edit(nick=self.nick)
                 await membro.add_roles(self.cargo)
                 registrar_recrutamento(guild.id, self.recrutador.id, membro.id)
+                # AQUI ESTÁ A RESPOSTA DE EDIÇÃO DE SUCESSO
                 await interaction.response.edit_message(
                     content=f"✅ Solicitação aprovada por {interaction.user.mention}", view=None
                 )
             elif acao == "rejeitar":
+                 # AQUI ESTÁ A RESPOSTA DE EDIÇÃO DE SUCESSO
                 await interaction.response.edit_message(
                     content=f"❌ Solicitação rejeitada por {interaction.user.mention}", view=None
                 )
-
-            # Log
+            
+            # --- Log (Usa Followup se a resposta já foi dada) ---
             if self.config.get("canal_log_id"):
                 canal_log = guild.get_channel(self.config["canal_log_id"])
                 if canal_log:
@@ -586,59 +686,37 @@ class ConfirmacaoView(View):
                     embed_log.add_field(name="Recrutador", value=self.recrutador.mention, inline=False)
                     embed_log.add_field(name="Ação", value="Aprovado" if acao == "aprovar" else "Rejeitado", inline=False)
                     embed_log.add_field(name="Responsável", value=interaction.user.mention, inline=False)
-                    await canal_log.send(embed=embed_log)
+                    await canal_log.send(embed=embed_log) # Não precisa de followup/response aqui, é apenas uma nova mensagem.
+
 
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "❌ Não foi possível aplicar a ação (verifique a hierarquia de cargos).",
-                ephemeral=True
-            )
+            # Se a resposta ainda não foi dada, envia uma resposta de erro.
+            # Caso contrário, usa followup para garantir a resposta.
+            if interaction.response.is_done():
+                 await interaction.followup.send(
+                    "❌ Não foi possível aplicar a ação (verifique a hierarquia de cargos).",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Não foi possível aplicar a ação (verifique a hierarquia de cargos).",
+                    ephemeral=True
+                )
         except Exception as e:
-            await interaction.response.send_message(
-                f"❌ Erro inesperado ao processar: {e}",
-                ephemeral=True
-            )
+            # Mesma lógica para qualquer outro erro.
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"❌ Erro inesperado ao processar: {e}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    f"❌ Erro inesperado ao processar: {e}",
+                    ephemeral=True
+                )
         finally:
             await asyncio.sleep(1)
             ConfirmacaoView.bloqueios.discard(membro.id)
-
-    async def on_timeout(self):
-        try:
-            # Verifica se a mensagem ainda existe para editar
-            if self.message:
-                for child in self.children:
-                    child.disabled = True
-                await self.message.edit(
-                    content="⌛ **Solicitação expirada** — ninguém aprovou ou rejeitou a tempo.",
-                    view=self
-                )
-
-                if self.config.get("canal_log_id"):
-                    guild = self.usuario.guild
-                    canal_log = guild.get_channel(self.config["canal_log_id"])
-                    if canal_log:
-                        embed_log = discord.Embed(
-                            title="⏰ Recrutamento Expirado",
-                            description=f"A solicitação de set para {self.usuario.mention} expirou automaticamente.",
-                            color=discord.Color.orange()
-                        )
-                        embed_log.add_field(name="Nick", value=self.nick, inline=False)
-                        embed_log.add_field(name="Cargo", value=self.cargo.mention, inline=False)
-                        embed_log.add_field(name="Recrutador", value=self.recrutador.mention, inline=False)
-                        await canal_log.send(embed=embed_log)
-        except discord.NotFound:
-             # Mensagem já foi apagada
-            pass
-        except Exception as e:
-            print(f"[Erro Timeout] {e}")
-
-    @button(label="✅ Aprovar", style=discord.ButtonStyle.green)
-    async def aprovar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.processar(interaction, "aprovar")
-
-    @button(label="❌ Rejeitar", style=discord.ButtonStyle.red)
-    async def rejeitar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.processar(interaction, "rejeitar")
 
 
 # -------------------- Ranking de Recrutadores --------------------
@@ -984,16 +1062,60 @@ async def cmd_criar_nivel(interaction: discord.Interaction, nivel: int, nome: st
     await interaction.response.send_message(f"✅ Nível `{nivel}` criado com o nome `{nome}`!", ephemeral=True)
 
 
-@bot.tree.command(name="atribuir_acao", description="Atribui uma ação a um nível")
-@app_commands.describe(nivel="Número do nível", acao="Nome da ação")
-async def cmd_atribuir_acao(interaction: discord.Interaction, nivel: int, acao: str):
+# --- MODIFICAÇÃO DO COMANDO /atribuir_acao ---
+
+@bot.tree.command(name="atribuir_acao", description="Abre um painel para gerenciar quais ações pertencem a um nível.")
+async def cmd_atribuir_acao(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Apenas admins podem atribuir ações.", ephemeral=True)
         return
 
-    definir_acao_nivel(interaction.guild.id, nivel, acao)
-    await interaction.response.send_message(f"✅ Ação `{acao}` atribuída ao nível {nivel}!", ephemeral=True)
+    guild_id = interaction.guild.id
+    
+    # 1. Obtém os níveis disponíveis para o primeiro Select
+    niveis = niveis_disponiveis(guild_id)
+    if not niveis:
+        await interaction.response.send_message("⚠️ Nenhum nível criado. Use `/criar_nivel` primeiro.", ephemeral=True)
+        return
 
+    # 2. Cria o Select para escolher o Nível
+    options_niveis = [
+        discord.SelectOption(label=f"Nível {n}", value=str(n)) for n in sorted(niveis)
+    ]
+
+    select_nivel = Select(
+        placeholder="Escolha o nível para editar as ações...",
+        options=options_niveis,
+        min_values=1,
+        max_values=1
+    )
+
+    async def callback_nivel(interaction_nivel):
+        nivel_escolhido = int(interaction_nivel.data['values'][0])
+        
+        # 3. Após escolher o nível, exibe o Multi-Select de ações
+        view_acoes = AcaoNivelView(nivel_escolhido, guild_id)
+        
+        # Obtém o nome do nível para a mensagem (se estiver configurado)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT nome FROM niveis WHERE guild_id=? AND nivel=?", (str(guild_id), nivel_escolhido))
+        nome_nivel = c.fetchone()
+        conn.close()
+        nome_display = f"{nome_nivel[0]}" if nome_nivel else f"Nível {nivel_escolhido}"
+
+
+        await interaction_nivel.response.edit_message(
+            content=f"🛠️ Gerenciando ações para **{nome_display}**.",
+            embed=None,
+            view=view_acoes
+        )
+
+    select_nivel.callback = callback_nivel
+    view_inicial = View(timeout=180)
+    view_inicial.add_item(select_nivel)
+
+    await interaction.response.send_message("Primeiro, escolha o Nível que deseja configurar:", view=view_inicial, ephemeral=True)
 # Adicionar cargo a nível existente
 @bot.tree.command(name="add_cargo_nivel", description="Adiciona um cargo a um nível de permissão existente.")
 @app_commands.describe(
@@ -1453,84 +1575,97 @@ class PainelView(discord.ui.View):
         super().__init__(timeout=None)
         self.nivel_usuario = nivel_usuario
         
+        # Adiciona botões dinamicamente com base nas ações do nível
         if "configuracao" in acoes:
             self.add_item(discord.ui.Button(label="⚙️ Configurações",
-                                  style=discord.ButtonStyle.primary, custom_id="config"))
+                                  style=discord.ButtonStyle.primary, custom_id="config")) # Exemplo de custom_id
         if "relatorios" in acoes:
             self.add_item(discord.ui.Button(
-                label="📊 Relatórios", style=discord.ButtonStyle.success, custom_id="relatorio"))
+                label="📊 Relatórios", style=discord.ButtonStyle.success, custom_id="relatorio")) # Exemplo de custom_id
         if "visual" in acoes:
             self.add_item(discord.ui.Button(
-                label="🎨 Visual", style=discord.ButtonStyle.secondary, custom_id="visual"))
+                label="🎨 Visual", style=discord.ButtonStyle.secondary, custom_id="visual")) # Exemplo de custom_id
 
+    # Botão para atualizar o painel
     @discord.ui.button(label="🧭 Atualizar painel", style=discord.ButtonStyle.gray, row=1)
     async def atualizar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await comando_painel(interaction)
+        # CORREÇÃO APLICADA AQUI: Chamar a função _exibir_painel_logica diretamente
+        await _exibir_painel_logica(interaction)
 
     async def interaction_check(self, interaction: discord.Interaction):
-        return True # Permite que qualquer um com o painel interaja
+        # Você pode adicionar verificações aqui se quiser restringir quem pode interagir com o painel
+        return True 
 
 
-# Funções de níveis e ações (mantidas no escopo)
-
-# Painel dinâmico
-async def exibir_painel(interaction: discord.Interaction):
+# Função auxiliar que contém a lógica de exibição do painel
+async def _exibir_painel_logica(interaction: discord.Interaction):
     user = interaction.user
     guild_id = interaction.guild.id
 
     # Detecta o nível mais alto do usuário
     nivel_usuario = None
     
-    # Obtém todos os níveis configurados
-    todos_niveis = niveis_disponiveis(guild_id)
+    todos_niveis = niveis_disponiveis(guild_id) # Esta função deve retornar os níveis numéricos
     
     for nivel in sorted(todos_niveis, reverse=True): # Começa do nível mais alto
+        # Checa se o usuário tem permissão para este nível
         if checar_permissao_multiplos_niveis(user, nivel):
             nivel_usuario = nivel
             break
 
     if nivel_usuario is None:
         await interaction.response.send_message(
-            "🔒 Você não possui nenhum nível de permissão configurado.",
+            "🔒 Você não possui nenhum nível de permissão configurado ou não tem acesso.",
             ephemeral=True
         )
         return
 
-    # Adiciona campos dinamicamente de acordo com as ações do nível
+    # Obtém as ações configuradas para o nível do usuário
     acoes = obter_acoes_nivel(guild_id, nivel_usuario)
     
-    # Cria o embed
+    # Cria o embed do painel
     embed = discord.Embed(
         title=f"🧭 Painel de Controle (Nível {nivel_usuario})",
-        description="Selecione uma das opções abaixo para ver seus comandos disponíveis.",
+        description="Selecione uma das opções abaixo para ver seus comandos disponíveis:",
         color=discord.Color.blue()
     )
 
     if "configuracao" in acoes:
         embed.add_field(
             name="⚙️ Configurações",
-            value="Comandos de configuração do sistema e níveis",
+            value="`/configuração`, `/criar_nivel`, `/add_cargo_nivel`, `/remover_cargo_nivel`, `/configurar_tempo_expiracao`",
             inline=False
         )
     if "relatorios" in acoes:
         embed.add_field(
             name="📊 Relatórios",
-            value="Comandos de ranking e relatórios",
+            value="`/ranking_de_rec`, `/listar_cadastros`, `/remover_cadastro`",
             inline=False
         )
     if "visual" in acoes:
         embed.add_field(
             name="🎨 Visual",
-            value="Comandos para botão de recrutamento e mensagens",
+            value="`/enviar_botao_recrutamento`, `/setar_mensagem_botao`",
             inline=False
         )
-    
-    # Se não houver ações configuradas
+    if "atribuicao_acao" in acoes: # Novo campo se você quiser ter uma ação específica para atribuir_acao
+         embed.add_field(
+            name="🛠️ Atribuição de Ações",
+            value="`/atribuir_acao`",
+            inline=False
+        )
+
+    # Se não houver ações configuradas para este nível
     if not acoes:
         embed.add_field(name="Sem Ações", value="Nenhuma ação foi configurada para o seu nível.", inline=False)
 
-    # Exibe o painel
-    await interaction.response.send_message(embed=embed, view=PainelView(nivel_usuario, acoes), ephemeral=True)
+    # Envia o painel com a View contendo os botões
+    # Se a interação já foi respondida (ex: por um Select antes), usa followu.send
+    # Caso contrário, usa response.send_message
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, view=PainelView(nivel_usuario, acoes), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, view=PainelView(nivel_usuario, acoes), ephemeral=True)
 
 
 # Comando /painel
@@ -1539,7 +1674,8 @@ async def exibir_painel(interaction: discord.Interaction):
     description="Mostra o painel de controle conforme seu nível de permissão."
 )
 async def comando_painel(interaction: discord.Interaction):
-    await exibir_painel(interaction)
+    # O comando de barra agora chama a função auxiliar _exibir_painel_logica
+    await _exibir_painel_logica(interaction)
 
 
 # -------------------- Recriação automática da mensagem de recrutamento --------------------
