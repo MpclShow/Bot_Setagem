@@ -540,7 +540,39 @@ class RecrutamentoModal(Modal, title="📋 Solicitação de Recrutamento"):
             await interaction.response.send_message(f"❌ Cargo necessário não encontrado.", ephemeral=True)
             return
 
-        # Busca canal de confirmação
+        # 1. CONSTRÓI A STRING COMPLETA
+        nick_proposto = f"{prefixo_usado} | {self.nome.value} | {self.id_jogo.value}"
+
+        # 2. VALIDAÇÃO E TRUNCAGEM DO APELIDO (MÁXIMO DE 32 CARACTERES)
+        nick_final = nick_proposto
+        if len(nick_proposto) > 32:
+            # Ponto de corte para garantir que o apelido tenha no máximo 32 caracteres.
+            
+            # Formato: [PREFIXO] | [NOME] | [ID]
+            # Vamos garantir que os separadores e prefixo + ID sejam mantidos, truncando o nome.
+            
+            # Componentes fixos: ex: "PXR |  | 1234" -> 4 (prefixo) + 3 (' | ') + 3 (' | ') + 4 (ID) = 14 caracteres
+            # A ideia é garantir que o nome caiba no espaço restante.
+            
+            # Tamanho da parte fixa (prefixo + separadores + ID)
+            # len(f" |  | ") é 6. 
+            comp_fixos = len(prefixo_usado) + len(f" | {self.id_jogo.value}") + 3
+            
+            espaco_disponivel_para_nome = 32 - comp_fixos
+            
+            if espaco_disponivel_para_nome <= 0:
+                # Caso extremo: prefixo e ID juntos já ultrapassam 32 caracteres
+                nick_final = nick_proposto[:32]
+            else:
+                # Trunca o nome do usuário para caber no espaço disponível
+                nome_truncado = self.nome.value[:espaco_disponivel_para_nome]
+                nick_final = f"{prefixo_usado} | {nome_truncado} | {self.id_jogo.value}"
+        
+        # Opcional: Verifica se, após a truncagem, o nick ainda termina em " | ".
+        # Isso pode acontecer se o nick truncado for muito curto.
+        nick_final = nick_final.strip()
+        
+        # 3. Busca canal de confirmação e envia a solicitação
         if config.get("canal_confirmacao_id"):
             canal_confirmacao = guild.get_channel(
                 config["canal_confirmacao_id"])
@@ -550,7 +582,7 @@ class RecrutamentoModal(Modal, title="📋 Solicitação de Recrutamento"):
                 embed.add_field(
                     name="Usuário", value=interaction.user.mention, inline=False)
                 embed.add_field(
-                    name="Nome", value=self.nome.value, inline=False)
+                    name="Nome Proposto", value=nick_final, inline=False) # Mostra o nick final (truncado ou não)
                 embed.add_field(
                     name="TEL", value=self.tel_jogo.value, inline=False)
                 embed.add_field(
@@ -559,16 +591,28 @@ class RecrutamentoModal(Modal, title="📋 Solicitação de Recrutamento"):
                     name="Cargo", value=cargo.mention, inline=False)
                 embed.add_field(
                     name="Recrutador", value=self.recrutador_member.mention, inline=False)
+                
+                # Instancia a View (Usando o nick_final)
                 view = ConfirmacaoView(
-                    interaction.user, f"{prefixo_usado} | {self.nome.value} | {self.id_jogo.value}", self.tel_jogo.value, cargo, self.recrutador_member, config)
-                await canal_confirmacao.send(embed=embed, view=view)
+                    usuario=interaction.user,
+                    nick=nick_final, # <-- NICK JÁ VALIDADO E TRUNCADO
+                    tel=self.tel_jogo.value,
+                    cargo=cargo,
+                    recrutador=self.recrutador_member,
+                    config=config
+                )
+                
+                # Envia a mensagem no canal de confirmação
+                message = await canal_confirmacao.send(embed=embed, view=view)
+                view.message = message # Para uso no on_timeout da View
+                
                 await interaction.response.send_message(f"✅ Sua solicitação foi enviada para aprovação em {canal_confirmacao.mention}", ephemeral=True)
             else:
                 await interaction.response.send_message(f"✅ Sua solicitação foi enviada para o recrutador!", ephemeral=True)
         # Se não houver canal de confirmação, confirma ao usuário
         else:
-             await interaction.response.send_message(f"✅ Sua solicitação foi enviada para o recrutador!", ephemeral=True)
-        
+            await interaction.response.send_message(f"✅ Sua solicitação foi enviada para o recrutador!", ephemeral=True)
+
 # -------------------- View de Aprovação --------------------
 
 
@@ -1736,4 +1780,5 @@ async def on_message_delete(message: discord.Message):
 # Inicie o servidor web e o bot
 keep_alive()
 bot.run(TOKEN)
+
 
