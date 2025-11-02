@@ -620,8 +620,8 @@ class ConfirmacaoView(View):
     bloqueios = set()  # Guarda IDs de usuários sendo processados (aprovação ou rejeição)
 
     def __init__(self, usuario: discord.Member, nick: str, tel: str, cargo: discord.Role, recrutador: discord.Member, config):
-        tempo_exp = config.get("tempo_expiracao", 6000)
-        super().__init__(timeout=tempo_exp * 6000)
+        tempo_exp = config.get("tempo_expiracao", 10)
+        super().__init__(timeout=tempo_exp * 60)
         self.usuario = usuario
         self.nick = nick
         self.tel = tel
@@ -1780,6 +1780,7 @@ async def on_message_delete(message: discord.Message):
 # Inicie o servidor web e o bot
 keep_alive()
 bot.run(TOKEN)
+
 
 
 
